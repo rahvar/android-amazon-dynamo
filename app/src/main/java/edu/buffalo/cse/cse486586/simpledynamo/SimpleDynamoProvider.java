@@ -16,8 +16,10 @@ import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Formatter;
 import java.util.HashMap;
+import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 
 import android.content.ContentProvider;
@@ -28,6 +30,8 @@ import android.database.Cursor;
 import android.database.MatrixCursor;
 import android.net.Uri;
 import android.os.AsyncTask;
+import android.os.Bundle;
+import android.os.SystemClock;
 import android.telephony.TelephonyManager;
 import android.util.Log;
 
@@ -40,13 +44,25 @@ public class SimpleDynamoProvider extends ContentProvider {
 	String succNode = "";
 	HashMap<String,String> insertFlagMap = new HashMap<String, String>();
 
-	HashMap<String,Node> nodeTable = new HashMap<String, Node>();
+
+	boolean failureRec = true;
+	//HashMap<String,Integer> versionMap = new HashMap<String, Integer>();
+
+	HashMap<String,Long> failureVersioning = new HashMap<String, Long>();
+	HashMap<String,Node> nodeTable;
+	HashMap<String,String> missedKeyVals = new HashMap<String,String>();
 	BlockingQueue<String> bq = new ArrayBlockingQueue<String>(5);
+
+	BlockingQueue<String> insertBq = new ArrayBlockingQueue<String>(5);
+	BlockingQueue<String> failureBq = new ArrayBlockingQueue<String>(5);
 
 
 
 	ContentResolver contentProvider;
 	Uri gUri;
+
+
+
 
 	/**
 	 * ATTENTION: This was auto-generated to implement the App Indexing API.
@@ -66,6 +82,10 @@ public class SimpleDynamoProvider extends ContentProvider {
 	public boolean onCreate() {
 		// TODO Auto-generated method stub
 
+
+
+		Log.d(TAG,"CurrentTimeIs: "+ System.currentTimeMillis());
+
 		TelephonyManager tel = (TelephonyManager) getContext().getSystemService(Context.TELEPHONY_SERVICE);
 		String portStr = tel.getLine1Number().substring(tel.getLine1Number().length() - 4);
 
@@ -73,6 +93,8 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 		currNode = portStr;
 		currPort = myPort;
+
+		nodeTable = new HashMap<String, Node>();
 
 		nodeTable.put("5554",new Node("5554","5558","5556"));
 		nodeTable.put("5556",new Node("5556","5554","5562"));
@@ -117,20 +139,28 @@ public class SimpleDynamoProvider extends ContentProvider {
 		}
 
 
+		/*try {
+			Thread.sleep(1000);
+		} catch (InterruptedException e) {
+			e.printStackTrace();
+		}*/
+
+		Log.d(TAG,"CrashedAndRecovered");
+
+
+		//Cursor cursor = contentProvider.query(gUri,null,"*",null,null);
 
 
 
+		new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR,"failureRecover");
 
-		new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR,"Testing");
-
+		//Cursor cursor = contentProvider.query(gUri,null,"*",null,null);
 		//sendPkt("Testing","11108","TestAck","TestLog");
 
+		//Log.d(TAG,"CurrentTimeIs: "+ System.currentTimeMillis());
 
 		return false;
-
-
 	}
-
 
 
 
@@ -181,29 +211,32 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 					}
 					if(data.startsWith("query")){
-						Log.d(TAG,"RecievedQueryMessage");
+						Log.d(TAG,"RecievedQueryMessage: "+data);
 
 						String[] info = data.split(":");
 
 						String key = info[1].trim();
 
-						String originalSender = info[3];
-						String[] selArgs = new String[]{originalSender};
 
-						contentProvider.query(gUri,null,key,selArgs,null);
 
-						outStream.writeBytes("queryAck\n");
+						String [] selArgs  = new String[]{"secEntry"};
+						Cursor cursor = contentProvider.query(gUri,null,key,selArgs,null);
 
-					}
-					if(data.startsWith("keyFound")){
+						String out = "";
+						if (cursor.moveToFirst()){
+							do{
+								String k1 = cursor.getString(cursor.getColumnIndex("key"));
+								String v1 = cursor.getString(cursor.getColumnIndex("value"));
+								out+=k1+"-"+v1+":";
 
-						String[] info = data.split(":");
+								// do what ever you want here
+							}while(cursor.moveToNext());
+						}
+						cursor.close();
 
-						String key = info[1].trim();
-						String value = info[2].trim();
-						bq.put(key+"-"+value);
 
-						outStream.writeBytes("keyFoundAck\n");
+						outStream.writeBytes("queryAck::"+out+"\n");
+
 					}
 					if(data.startsWith("star")){
 
@@ -228,6 +261,51 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 						outStream.writeBytes("starAck::"+out+ "\n");
 					}
+					if(data.startsWith("failure")){
+
+
+
+
+						Log.d(TAG,"ServerRec: FailureRecRequest: "+currNode);
+
+						String[] selArgs = new String[]{"FailureRec"};
+						Cursor cursor = contentProvider.query(gUri,null,"@",selArgs,null);
+
+						//Log.d(TAG,"Maybe");
+						String out = "";
+
+
+						if (cursor.moveToFirst()){
+							do{
+								String k1 = cursor.getString(cursor.getColumnIndex("key"));
+								String v1 = cursor.getString(cursor.getColumnIndex("value"));
+								out+=k1+"-"+v1+":";
+
+								// do what ever you want here
+							}while(cursor.moveToNext());
+						}
+						cursor.close();
+
+						if(out.isEmpty()){
+							out="*";
+						}
+						//Log.d(TAG,"RetrievedData::"+sender+":::"+out);
+
+						//outStream.writeBytes("starAck::"+out+ "\n");
+
+						outStream.writeBytes("failureAck::"+out+"\n");
+					}
+
+					if(data.startsWith("delete")){
+
+						String key = data.split(":")[1].trim();
+
+						String[] selArgs = new String[]{"deleteRep"};
+						contentProvider.delete(gUri,key,selArgs);
+
+						outStream.writeBytes("DeleteAck\n");
+
+					}
 
 					//clientSocket.close();
 
@@ -242,6 +320,21 @@ public class SimpleDynamoProvider extends ContentProvider {
 		}
 	}
 
+	public boolean keyBelongsToNode(String key,String node){
+
+		String keyHash = null;
+		try {
+			keyHash = genHash(key);
+		} catch (NoSuchAlgorithmException e) {
+			e.printStackTrace();
+		}
+		Node n = nodeTable.get(node);
+
+		return (keyHash.compareTo(n.getPredId())>0 && keyHash.compareTo(n.getNodeId())<0)
+				|| (n.getPredId().compareTo(n.getNodeId()) >0 && keyHash.compareTo(n.getPredId())>0 )
+				|| (n.getPredId().compareTo(n.getNodeId()) >0 && keyHash.compareTo(n.getNodeId())<0 );
+	}
+
 	public ArrayList<String> getPrefList(String key){
 
 		String coordNode="";
@@ -253,16 +346,16 @@ public class SimpleDynamoProvider extends ContentProvider {
 			e.printStackTrace();
 		}
 		for(String k:nodeTable.keySet()){
-			Log.d(TAG,"Checking Node: "+k);
+			//Log.d(TAG,"Checking Node: "+k);
 			Node n = nodeTable.get(k);
 
-			Log.d(TAG,"Comparing "+keyHash+": "+n.getPredId()+" :"+n.getNodeId());
+			//Log.d(TAG,"Comparing "+keyHash+": "+n.getPredId()+" :"+n.getNodeId());
 			if( (keyHash.compareTo(n.getPredId())>0 && keyHash.compareTo(n.getNodeId())<0)
 					|| (n.getPredId().compareTo(n.getNodeId()) >0 && keyHash.compareTo(n.getPredId())>0 )
 					|| (n.getPredId().compareTo(n.getNodeId()) >0 && keyHash.compareTo(n.getNodeId())<0 )) {
 
 
-				Log.d(TAG,"Wtf This shouldnt happen");
+				//Log.d(TAG,"Wtf This shouldnt happen");
 				coordNode = k;
 				break;
 			}
@@ -275,7 +368,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 		String last = nodeTable.get(next).getSucc();
 		repList.add(last);
 
-		Log.d(TAG,"FinalRepList:"+repList);
+		//Log.d(TAG,"FinalRepList:"+repList);
 		return repList;
 	}
 
@@ -288,10 +381,154 @@ public class SimpleDynamoProvider extends ContentProvider {
 		protected Void doInBackground(String... msgs) {
 			String msgToSend = msgs[0] + "\n";
 
+			Log.d(TAG,"Received Message: "+msgToSend);
 			//sendPkt("Testing","11108","TestAck","TestLog");
-			if (msgToSend.startsWith("insert")) {
-				try {
+			if(msgToSend.startsWith("failure")){
 
+
+				//contentProvider.delete(gUri,"@",null);
+
+				Log.d(TAG,"Testing out failure");
+
+				String allVals="";
+
+				String pred = nodeTable.get(currNode).getPred();
+				String succ = nodeTable.get(currNode).getSucc();
+
+				ArrayList<String> failRecNodes = new ArrayList<String>();
+
+				failRecNodes.add(pred);
+				failRecNodes.add(succ);
+
+				for(String node:nodeTable.keySet()){
+					try {
+
+						if(node.equals(currNode))
+							continue;
+						Log.d(TAG,"EnteredFailureRec: "+msgToSend);
+
+
+						//String key = info[1].trim();
+
+						//Log.d(TAG,"QueryingKey: "+key);
+						String remotePort = Integer.toString(Integer.parseInt(node) * 2);
+						//Log.d(TAG,"Sending Query To"+key+": "+remotePort);
+						Socket socket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
+								Integer.parseInt(remotePort));
+
+						//msgToSend = msgToSend.trim() + ":"+currNode+"\n";
+
+						DataOutputStream outStream = new DataOutputStream(socket.getOutputStream());
+						outStream.writeBytes(msgToSend);
+
+						BufferedReader in = new BufferedReader(
+								new InputStreamReader(socket.getInputStream()));
+
+						String ack = in.readLine();
+						if (ack.startsWith("failureAck")) {
+
+							String[] inf = ack.split("::");
+
+							if(!inf[1].trim().equals("*"))
+								allVals += inf[1].trim();
+
+							Log.d(TAG,"FailureAck Successfull");
+							socket.close();
+
+						}
+					}catch (Exception e){
+						Log.d(TAG,"FailureRecException: "+e);
+					}
+				}
+
+
+				ContentValues[] missedResults ;
+				List<ContentValues> missedResList = new ArrayList<ContentValues>();
+
+				if(!allVals.isEmpty()&& allVals.length()>1){
+
+					String[] KeyVals = allVals.split(":");
+
+					for(String kvP: KeyVals){
+
+						//Log.d(TAG,"UpdatingAfterFailure: "+kvP);
+						String[] kvPair = kvP.split("-");
+						if(kvPair.length<2)
+							continue;
+						String key = kvPair[0];
+
+						String[] valueInfo = kvPair[1].split("##");
+						long curVersion = 0;
+
+						Log.d(TAG,"PossibleRecKeyVals: "+kvP);
+
+						String value = valueInfo[0];
+						long  version = Long.parseLong(valueInfo[1]);
+
+						if(getPrefList(key).contains(currNode)) {
+							if (failureVersioning.containsKey(key)) {
+								curVersion = failureVersioning.get(key);
+
+							}
+
+							if (version-curVersion>0) {
+
+								Log.d(TAG,"UpdatingAfterFailure: "+kvP);
+								failureVersioning.put(key,version);
+								//versionMap.put(key,version);
+								missedKeyVals.put(key,kvPair[1]);
+
+								//ContentValues cv = new ContentValues();
+
+
+								//String value = info[2].trim();
+
+								//insertFlagMap.put(key+":"+kvPair[1],"y");
+								//cv.put("key", key);
+								//cv.put("value", kvPair[1]);
+
+								//missedResList.add(cv);
+								//contentProvider.insert(gUri, cv);
+
+							}
+
+						}
+					}
+
+					for(String k:missedKeyVals.keySet()){
+
+						ContentValues cv = new ContentValues();
+
+
+
+						//String value = info[2].trim();
+
+						//insertFlagMap.put(key+":"+kvPair[1],"y");
+						cv.put("key", k);
+						cv.put("value", missedKeyVals.get(k));
+
+						Log.d(TAG,"AddingMissedVals: "+k+":"+missedKeyVals.get(k));
+
+
+						contentProvider.insert(gUri,cv);
+						missedResList.add(cv);
+
+					}
+
+					missedResults = new ContentValues[missedResList.size()];
+					missedResList.toArray(missedResults);
+
+					//if(missedResList.size()>0)
+					//	contentProvider.bulkInsert(gUri,missedResults);
+
+				}
+
+			}
+
+			if (msgToSend.startsWith("insert")) {
+
+
+					int insertCount =0;
 					Log.d(TAG,"EnteredInsert"+msgToSend);
 					String[] info = msgToSend.split(":");
 
@@ -300,18 +537,79 @@ public class SimpleDynamoProvider extends ContentProvider {
 					Log.d(TAG,"InsertionKey: "+key);
 
 					ArrayList<String> repNodes = getPrefList(key);
+					if(repNodes.contains(currNode)) {
+						repNodes.remove(currNode);
+						insertCount+=1;
+					}
 
 					Log.d(TAG,"RepNodes: "+repNodes.toString());
 					for (String node : repNodes) {
+						try {
 
+							String remotePort = Integer.toString(Integer.parseInt(node) * 2);
+							Log.d(TAG, "Sending Insert " + key + ": " + remotePort);
+							Socket socket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
+									Integer.parseInt(remotePort));
+
+
+							DataOutputStream outStream = new DataOutputStream(socket.getOutputStream());
+
+							outStream.writeBytes(msgToSend);
+
+							BufferedReader in = new BufferedReader(
+									new InputStreamReader(socket.getInputStream()));
+
+							String ack = in.readLine();
+							if (ack.startsWith("InsertAck")) {
+								socket.close();
+
+								insertCount+=1;
+								if(insertCount==2){
+									insertBq.put("Done");
+								}
+
+							}
+
+
+						} catch (Exception e) {
+							Log.d(TAG, "InsertionException: " + e);
+						}
+
+					}
+
+
+
+			}
+			if(msgToSend.startsWith("query")){
+
+
+				 	int queryCount=0;
+					Log.d(TAG,"EnteredQuery"+msgToSend);
+					String[] info = msgToSend.split(":");
+
+					String key = info[1].trim();
+					ArrayList<String> repNodes = getPrefList(key);
+
+					if(repNodes.contains(currNode)) {
+						queryCount+=1;
+						repNodes.remove(currNode);
+					}
+
+					String queryKeyVals = "";
+					for(String node:repNodes) {
+
+						try {
+
+						Log.d(TAG, "QueryingKey: " + key);
 						String remotePort = Integer.toString(Integer.parseInt(node) * 2);
-						Log.d(TAG,"Sending Insert "+key+": "+remotePort);
+						Log.d(TAG, "Sending Query To" + key + ": " + remotePort);
 						Socket socket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
 								Integer.parseInt(remotePort));
 
-
+						//msgToSend = msgToSend.trim() + ":" + currNode + "\n";
 
 						DataOutputStream outStream = new DataOutputStream(socket.getOutputStream());
+
 
 						outStream.writeBytes(msgToSend);
 
@@ -319,91 +617,41 @@ public class SimpleDynamoProvider extends ContentProvider {
 								new InputStreamReader(socket.getInputStream()));
 
 						String ack = in.readLine();
-						if (ack.startsWith("InsertAck")) {
+						if (ack.startsWith("queryAck")) {
+
+							queryCount+=1;
+
+							String[] queryResult = ack.split("::");
+							if(queryResult[1].contains("##"))
+								queryKeyVals += queryResult[1];
+
 							socket.close();
+
+							if(queryCount>=2)
+								break;
 						}
 
+					}catch (Exception e){
+						Log.d(TAG,"QueryingException: "+e);
 					}
 
 
-				}catch (Exception e){
-					Log.d(TAG,"InsertionException: "+e);
-				}
+					}
 
-			}
-			if(msgToSend.startsWith("query")){
-
+				Log.d(TAG,"ReceivedQueryResults: "+queryKeyVals);
 				try {
-					Log.d(TAG,"EnteredQuery"+msgToSend);
-					String[] info = msgToSend.split(":");
-
-					String key = info[1].trim();
-
-					Log.d(TAG,"QueryingKey: "+key);
-					String remotePort = Integer.toString(Integer.parseInt(info[2].trim()) * 2);
-					Log.d(TAG,"Sending Query To"+key+": "+remotePort);
-					Socket socket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
-								Integer.parseInt(remotePort));
-
-					msgToSend = msgToSend.trim() + ":"+currNode+"\n";
-
-					DataOutputStream outStream = new DataOutputStream(socket.getOutputStream());
-
-
-
-					outStream.writeBytes(msgToSend);
-
-					BufferedReader in = new BufferedReader(
-								new InputStreamReader(socket.getInputStream()));
-
-					String ack = in.readLine();
-					if (ack.startsWith("queryAck")) {
-						socket.close();
-					}
-
-				}catch (Exception e){
-					Log.d(TAG,"QueryingException: "+e);
+					bq.put(queryKeyVals);
+				} catch (InterruptedException e) {
+					e.printStackTrace();
 				}
 
-			}
-			if(msgToSend.startsWith("keyFound")){
-
-
-				try {
-					Log.d(TAG,"EnteredKeyFound"+msgToSend);
-					String[] info = msgToSend.split(":");
-
-					//String key = info[1].trim();
-
-					//Log.d(TAG,"QueryingKey: "+key);
-					String remotePort = Integer.toString(Integer.parseInt(info[3].trim()) * 2);
-					//Log.d(TAG,"Sending Query To"+key+": "+remotePort);
-					Socket socket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
-							Integer.parseInt(remotePort));
-
-					//msgToSend = msgToSend.trim() + ":"+currNode+"\n";
-
-					DataOutputStream outStream = new DataOutputStream(socket.getOutputStream());
-
-
-
-					outStream.writeBytes(msgToSend);
-
-					BufferedReader in = new BufferedReader(
-							new InputStreamReader(socket.getInputStream()));
-
-					String ack = in.readLine();
-					if (ack.startsWith("keyFoundAck")) {
-						socket.close();
-					}
-
-				}catch (Exception e){
-					Log.d(TAG,"QueryingException: "+e);
-				}
 
 			}
+
+
 			if(msgToSend.startsWith("starQuery")){
 
+				Log.d(TAG,"EnteredClient: StarQuery");
 				String allVals="";
 				for(String node:nodeTable.keySet()){
 					if(node.equals(currNode))
@@ -455,6 +703,51 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 			}
 
+			if(msgToSend.startsWith("delete")){
+
+					Log.d(TAG,"EnteredDelete: "+msgToSend);
+					String[] info = msgToSend.split(":");
+
+					String key = info[1].trim();
+
+					//Log.d(TAG,"InsertionKey: "+key);
+
+					ArrayList<String> repNodes = getPrefList(key);
+
+					if(repNodes.contains(currNode))
+						repNodes.remove(currNode);
+
+
+					//Log.d(TAG,"RepNodes: "+repNodes.toString());
+					for (String node : repNodes) {
+						try {
+
+							String remotePort = Integer.toString(Integer.parseInt(node) * 2);
+							//Log.d(TAG, "Sending Insert " + key + ": " + remotePort);
+							Socket socket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
+									Integer.parseInt(remotePort));
+
+
+							DataOutputStream outStream = new DataOutputStream(socket.getOutputStream());
+
+							outStream.writeBytes(msgToSend);
+
+							BufferedReader in = new BufferedReader(
+									new InputStreamReader(socket.getInputStream()));
+
+							String ack = in.readLine();
+							if (ack.startsWith("DeleteAck")) {
+								socket.close();
+							}
+
+
+						} catch (Exception e) {
+							Log.d(TAG, "DeletionException: " + e);
+						}
+
+					}
+
+			}
 			return null;
 		}
 	}
@@ -464,6 +757,11 @@ public class SimpleDynamoProvider extends ContentProvider {
 		// TODO Auto-generated method stub
 
 		Log.d(TAG,"Entered Delete: "+selection);
+
+
+
+
+
 
 		if(selection.equals("*") || selection.equals("@")) {
 			File[] files = getContext().getFilesDir().listFiles();
@@ -486,13 +784,14 @@ public class SimpleDynamoProvider extends ContentProvider {
 				file.delete();
 				//Log.d(TAG,"Deleting "+selection+" at: "+cNode);
 			}
-			else {
-				//new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, "DelKey:" + selection, cNode);
+
+			if(selectionArgs==null || selectionArgs.length==0)
+				new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, "deleteKey:" + selection);
 
 				Log.d(TAG,"NeedToRouteDelete");
 				//Log.d(TAG,"Couldnt delete: "+selection+ "passing to "+ succNode);
 			}
-		}
+
 
 		return 0;
 	}
@@ -511,27 +810,70 @@ public class SimpleDynamoProvider extends ContentProvider {
 		String value = values.getAsString("value");
 
 		FileOutputStream outputStream;
+		boolean first = false;
+
+		Log.d(TAG, "Inserting: " + key + "-" + value);
+		ArrayList<String> repList = getPrefList(key);
+
+		if(!value.contains("#")){
+			value= value+ "##" + System.currentTimeMillis();
+			first = true;
+		}
 
 
-		if(insertFlagMap.containsKey(key+":"+value)) {
+		if (!first || repList.contains(currNode)) {
+
+
+			    try {
+
+					//Log.d(TAG, "Inserting: " + key + "-" + value);
+
+
+					//outputStream = openFileOutput(key, Context.MODE_PRIVATE);
+
+					File dir = getContext().getFilesDir();
+					File file = new File(dir,key);
+
+					if(file.exists()){
+
+						String existingValue = fetchQueryVal(key);
+						long oldVersion = Long.parseLong(existingValue.split("##")[1]);
+
+						long currVersion = Long.parseLong(value.split("##")[1]);
+						if(oldVersion-currVersion>0)
+							value = existingValue;
+
+					}
+
+					Log.d(TAG, "ActuallyInserted: " + key + "-" + value);
+					outputStream = getContext().openFileOutput(key, Context.MODE_PRIVATE);
+					outputStream.write(value.getBytes());
+					outputStream.close();
+
+					} catch (Exception e) {
+						Log.e("GroupMessenger", "File write failed");
+					}
+
+		}
+		if (first) {
+			new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, "inserting:" + key + ":" + value);
+
+
+
 			try {
-				//outputStream = openFileOutput(key, Context.MODE_PRIVATE);
-				outputStream = getContext().openFileOutput(key, Context.MODE_PRIVATE);
-				outputStream.write(value.getBytes());
-				outputStream.close();
-
-			} catch (Exception e) {
-				Log.e("GroupMessenger", "File write failed");
+				String res = insertBq.take();
+			} catch (InterruptedException e) {
+				e.printStackTrace();
 			}
-			insertFlagMap.remove(key+":"+value);
-		}
-		else{
-			new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR,"inserting:"+key+":"+value);
+
 
 		}
 
+
+		Log.d(TAG, "InsertCallReturned: " + key + "-" + value);
 		return uri;
 	}
+
 
 
 	public String fetchQueryVal(String selection){
@@ -550,6 +892,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 			Log.e(TAG, "ExceptionFile:" + e);
 		}
 
+
 		return value;
 
 	}
@@ -562,10 +905,10 @@ public class SimpleDynamoProvider extends ContentProvider {
 		String columnNames[] = {"key","value"};
 		MatrixCursor cursor = new MatrixCursor(columnNames,1);
 
-
-
 		if(selection.equals("*") || selection.equals("@")) {
 
+
+			Log.d(TAG,"EnteredStarCP: "+selection);
 			File[] files = getContext().getFilesDir().listFiles();
 			for (File file : files) {
 
@@ -574,77 +917,99 @@ public class SimpleDynamoProvider extends ContentProvider {
 				String[] splittedFileName = filename.split(pattern);
 
 				String s = file.toString();
-				cursor = fetchValue(cursor, splittedFileName[splittedFileName.length - 1]);
-				Log.d(TAG, "Logging files: " + splittedFileName[splittedFileName.length - 1]);
+
+				if(selectionArgs==null) {
+					//Thread.sleep();
+					cursor = fetchValue(cursor, splittedFileName[splittedFileName.length - 1]);
+				}
+				else{
+					cursor = fetchValueNoSplit(cursor, splittedFileName[splittedFileName.length - 1]);
+				}
+					//Log.d(TAG, "Logging files: " + splittedFileName[splittedFileName.length - 1]);
 			}
 
-			if(selection.equals("*")){
-				new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR,"starQuery");
+			if (selection.equals("*")) {
+				Log.d(TAG,"AboutToCallClient: "+selection);
+				new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, "starQuery");
 
 
 				try {
 					String starData = "";
 					starData = bq.take();
 
-					if(!starData.isEmpty()) {
+					if (starData!=null || !starData.isEmpty()) {
 						String[] kvPairs = starData.split(":");
 
 						for (String kv : kvPairs) {
 							Log.d(TAG, "KVPair:" + kv);
 							String[] kvOut = kv.split("-");
 
-							cursor.addRow(new Object[]{kvOut[0], kvOut[1]});
+							//String value = kvOut[1].split("##")[1];
+							cursor.addRow(new Object[]{kvOut[0],  kvOut[1]});
 
 						}
 					}
 
 
-
 				} catch (InterruptedException e) {
 					e.printStackTrace();
 				}
 
 			}
-
 		}
 		else if(selectionArgs==null || selectionArgs.length==0){
 
-			ArrayList<String> contNodes = getPrefList(selection);
+				ArrayList<String> prefList = getPrefList(selection);
+				String keyVals = "";
 
-			if(contNodes.contains(currNode)) {
+				Log.d(TAG,"OriginalQueryAt: "+selection+": "+currNode+"--"+prefList);
+			    if(prefList.contains(currNode)){
 
-				String value = fetchQueryVal(selection);
-				cursor.addRow(new Object[]{selection, value});
-			}
-			else{
+					String val = fetchQueryVal(selection);
+					keyVals+= selection+"-"+val+":";
+				}
+
+				new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR,"querying:"+selection);
 
 
-				new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR,"querying:"+selection+":"+contNodes.get(0));
-
-				String keyVal = "";
 				try {
-					keyVal = bq.take();
+					keyVals+= bq.take();
 				} catch (InterruptedException e) {
 					e.printStackTrace();
 				}
 
-				String[] kvPair = keyVal.split("-");
+				Log.d(TAG,"RetrievedKeyVals: "+keyVals);
+				String key = "";
+				String value ="";
+				long latestVersion = 0;
+				for(String kvPair:keyVals.split(":")){
 
-				String key = kvPair[0];
-				String value = kvPair[1];
+					if(kvPair.length()<=1)
+						continue;
+					String[] kv = kvPair.split("-");
+					String[] versionInfo = kv[1].split("##");
+
+					long versionStamp = Long.parseLong(versionInfo[1]);
+					if(versionStamp-latestVersion>0){
+
+
+						latestVersion = versionStamp;
+						key = kv[0];
+						value = versionInfo[0];
+					}
+				}
+
+				Log.d(TAG,"ReturningKeyVals: "+key+"-"+value);
 				cursor.addRow(new Object[]{key,value});
-
-
-
-			}
 		}
-		else if(selectionArgs.length>0){
-			String value = fetchQueryVal(selection);
+		else{
 
-			String originalSender = selectionArgs[0];
-			new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR,"keyFound:"+selection+":"+value+":"+originalSender);
+			Log.d(TAG,"ReturningQueryResults: "+selection+" :"+currNode);
+			String val = fetchQueryVal(selection);
 
+			cursor.addRow(new Object[]{selection,val});
 		}
+
 		return cursor;
 	}
 
@@ -666,9 +1031,40 @@ public class SimpleDynamoProvider extends ContentProvider {
 		} catch (IOException e) {
 			e.printStackTrace();
 		}
-		cursor.addRow(new Object[]{selection, value});
+
+		String[] valueSplit = value.split("##");
+		String actualVal = valueSplit[0];
+		cursor.addRow(new Object[]{selection,actualVal });
 		return cursor;
 	}
+
+
+	public MatrixCursor fetchValueNoSplit(MatrixCursor cursor,String selection){
+
+
+		String value="";
+		try {
+			StringBuilder builder = new StringBuilder();
+			FileInputStream inputStream = getContext().openFileInput(selection);
+			int ch;
+			while ((ch = inputStream.read()) != -1) {
+				builder.append((char) ch);
+			}
+			value = builder.toString();
+			inputStream.close();
+		} catch (FileNotFoundException e) {
+			Log.e("GroupMessenger", "Unable to read file");
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
+
+		Log.d(TAG,"Logging files @ query: "+selection+"-"+value);
+		//String[] valueSplit = value.split("##");
+		//String actualVal = valueSplit[0];
+		cursor.addRow(new Object[]{selection,value });
+		return cursor;
+	}
+
 	@Override
 	public int update(Uri uri, ContentValues values, String selection,
 					  String[] selectionArgs) {
