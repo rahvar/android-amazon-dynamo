@@ -45,15 +45,17 @@ public class SimpleDynamoProvider extends ContentProvider {
 	HashMap<String,String> insertFlagMap = new HashMap<String, String>();
 
 
-	boolean failureRec = true;
+	boolean failureRec;
 	//HashMap<String,Integer> versionMap = new HashMap<String, Integer>();
 
 	HashMap<String,Long> failureVersioning = new HashMap<String, Long>();
 	HashMap<String,Node> nodeTable;
 	HashMap<String,String> missedKeyVals = new HashMap<String,String>();
-	BlockingQueue<String> bq = new ArrayBlockingQueue<String>(5);
+	HashMap<String,Integer> acceptBQ = new HashMap<String, Integer>();
+
 
 	BlockingQueue<String> insertBq = new ArrayBlockingQueue<String>(5);
+    BlockingQueue<String> starBq = new ArrayBlockingQueue<String>(5);
 	BlockingQueue<String> failureBq = new ArrayBlockingQueue<String>(5);
 
 
@@ -110,6 +112,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 		gUri = buildUri("content", "edu.buffalo.cse.cse486586.simpledynamo.provider");
 
 
+		failureRec = false;
 		try {
             /*
              * Create a server socket as well as a thread (AsyncTask) that listens on the server
@@ -372,21 +375,23 @@ public class SimpleDynamoProvider extends ContentProvider {
 		return repList;
 	}
 
-	private class ClientTask extends AsyncTask<String, Void, Void> {
+	private class ClientTask extends AsyncTask<Object, Void, Void> {
 
 
 
 
 		@Override
-		protected Void doInBackground(String... msgs) {
+		protected Void doInBackground(Object... msgs) {
 			String msgToSend = msgs[0] + "\n";
+
+
 
 			Log.d(TAG,"Received Message: "+msgToSend);
 			//sendPkt("Testing","11108","TestAck","TestLog");
 			if(msgToSend.startsWith("failure")){
 
 
-				//contentProvider.delete(gUri,"@",null);
+				contentProvider.delete(gUri,"@",null);
 
 				Log.d(TAG,"Testing out failure");
 
@@ -518,10 +523,14 @@ public class SimpleDynamoProvider extends ContentProvider {
 					missedResults = new ContentValues[missedResList.size()];
 					missedResList.toArray(missedResults);
 
+
+
 					//if(missedResList.size()>0)
 					//	contentProvider.bulkInsert(gUri,missedResults);
 
 				}
+
+				failureRec = true;
 
 			}
 
@@ -583,6 +592,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 			if(msgToSend.startsWith("query")){
 
 
+                    BlockingQueue<String> queryBq = (BlockingQueue<String>)  msgs[1];
 				 	int queryCount=0;
 					Log.d(TAG,"EnteredQuery"+msgToSend);
 					String[] info = msgToSend.split(":");
@@ -639,8 +649,9 @@ public class SimpleDynamoProvider extends ContentProvider {
 					}
 
 				Log.d(TAG,"ReceivedQueryResults: "+queryKeyVals);
+				//acceptBQ.put(key,1);
 				try {
-					bq.put(queryKeyVals);
+                    queryBq.put(queryKeyVals);
 				} catch (InterruptedException e) {
 					e.printStackTrace();
 				}
@@ -696,7 +707,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 				}
 
 				try {
-					bq.put(allVals);
+					starBq.put(allVals);
 				} catch (InterruptedException e) {
 					e.printStackTrace();
 				}
@@ -902,10 +913,28 @@ public class SimpleDynamoProvider extends ContentProvider {
 						String[] selectionArgs, String sortOrder) {
 		// TODO Auto-generated method stub
 
+
+
+
+		if(selectionArgs==null){
+
+			while(!failureRec){
+				try {
+					Thread.sleep(200);
+				} catch (InterruptedException e) {
+					e.printStackTrace();
+				}
+			}
+		}
+
+
+
 		String columnNames[] = {"key","value"};
 		MatrixCursor cursor = new MatrixCursor(columnNames,1);
 
 		if(selection.equals("*") || selection.equals("@")) {
+
+
 
 
 			Log.d(TAG,"EnteredStarCP: "+selection);
@@ -935,7 +964,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 				try {
 					String starData = "";
-					starData = bq.take();
+					starData = starBq.take();
 
 					if (starData!=null || !starData.isEmpty()) {
 						String[] kvPairs = starData.split(":");
@@ -959,7 +988,9 @@ public class SimpleDynamoProvider extends ContentProvider {
 		}
 		else if(selectionArgs==null || selectionArgs.length==0){
 
-				ArrayList<String> prefList = getPrefList(selection);
+                BlockingQueue<String> bq = new ArrayBlockingQueue<String>(5);
+
+                ArrayList<String> prefList = getPrefList(selection);
 				String keyVals = "";
 
 				Log.d(TAG,"OriginalQueryAt: "+selection+": "+currNode+"--"+prefList);
@@ -969,15 +1000,25 @@ public class SimpleDynamoProvider extends ContentProvider {
 					keyVals+= selection+"-"+val+":";
 				}
 
-				new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR,"querying:"+selection);
+				new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR,"querying:"+selection,bq);
 
+                /*
+				while(!acceptBQ.containsKey(selection)){
 
+					try {
+						Thread.sleep(10);
+					} catch (InterruptedException e) {
+						e.printStackTrace();
+					}
+				}*/
 				try {
 					keyVals+= bq.take();
 				} catch (InterruptedException e) {
 					e.printStackTrace();
 				}
 
+
+				//acceptBQ.remove(selection);
 				Log.d(TAG,"RetrievedKeyVals: "+keyVals);
 				String key = "";
 				String value ="";
@@ -987,6 +1028,8 @@ public class SimpleDynamoProvider extends ContentProvider {
 					if(kvPair.length()<=1)
 						continue;
 					String[] kv = kvPair.split("-");
+					if(kv.length<2)
+						continue;
 					String[] versionInfo = kv[1].split("##");
 
 					long versionStamp = Long.parseLong(versionInfo[1]);
